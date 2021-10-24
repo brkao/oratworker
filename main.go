@@ -3,7 +3,11 @@ package main
 import (
 	"bufio"
 	"compress/gzip"
+	"context"
+	"errors"
 	"fmt"
+	"github.com/aws/aws-lambda-go/events"
+	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
@@ -19,7 +23,7 @@ import (
 
 const (
 	region              = "us-east-1"
-	bucket              = "orats-snapshots"
+	bucket              = "obuck"
 	keyspacesHost       = "cassandra.us-east-1.amazonaws.com:9142"
 	keyspacesCRTUrl     = "https://certs.secureserver.net/repository/sf-class2-root.crt"
 	keyspacesCRTName    = "sf-class2-root.crt"
@@ -27,14 +31,15 @@ const (
 	timeLayout          = time.RFC3339
 	tmpLocalFileGZName  = "snapshot.csv.gz"
 	tmpLocalFileCSVName = "snapshot.csv"
-	keyspacesUser       = "kryptek-aws-api+1-at-439416760204"
-	keyspacesPass       = "QfxcWSYPD3X8LsyZHZU4PDp5HibSTZnBhN/GIyH78ls="
 	keyspaceName        = "orats"
 	snapshotTableName   = "snapshots"
 	errorRetrySeconds   = 10
-	AccessKeyId         = "AKIAWMT2HU6GBKRBUOQZ"
-	SecretAccessKey     = "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"
 )
+
+var AccessKeyId string
+var SecretAccessKey string
+var KeyspacesUser string
+var KeyspacesPass string
 
 var columns = [...]string{"\"ticker\"",
 	"\"tradeDate\"",
@@ -235,8 +240,8 @@ func InsertCSVtoKeyspaces(csvFile string) error {
 	cluster := gocql.NewCluster(keyspacesHost)
 	// add your service specific credentials
 	cluster.Authenticator = gocql.PasswordAuthenticator{
-		Username: keyspacesUser,
-		Password: keyspacesPass}
+		Username: KeyspacesUser,
+		Password: KeyspacesPass}
 	// provide the path to the sf-class2-root.crt
 	cluster.SslOpts = &gocql.SslOptions{
 		CaPath: keyspacesCRTName,
@@ -287,6 +292,19 @@ func InsertCSVtoKeyspaces(csvFile string) error {
 }
 
 func Init() error {
+	AccessKeyId = os.Getenv("ACCESS_KEY_ID")
+	SecretAccessKey = os.Getenv("SECRET_ACCESS_KEY")
+	KeyspacesUser = os.Getenv("KEYSPACES_USER")
+	KeyspacesPass = os.Getenv("KEYSPACES_PASS")
+
+	if len(AccessKeyId) == 0 || len(SecretAccessKey) == 0 {
+		fmt.Printf("Invalid S3 credentials\n")
+		return errors.New("Invalid S3 Credentials")
+	}
+	if len(KeyspacesUser) == 0 || len(KeyspacesPass) == 0 {
+		fmt.Printf("Invalid Keyspaces credentials\n")
+		return errors.New("Invalid Keyspaces credentials")
+	}
 
 	os.Setenv("AWS_ACCESS_KEY_ID", AccessKeyId)
 	os.Setenv("AWS_SECRET_ACCESS_KEY", SecretAccessKey)
@@ -329,10 +347,57 @@ func GetMostRecentTimestamp() (time.Time, error) {
 	return mostRecent, nil
 }
 
+func handler(ctx context.Context, s3Event events.S3Event) {
+	log.Printf("Lambda Handler Called\n")
+	for _, record := range s3Event.Records {
+		s3 := record.S3
+		log.Printf("[%s - %s] Bucket = %s, Key = %s \n",
+			record.EventSource, record.EventTime, s3.Bucket.Name, s3.Object.Key)
+		log.Printf("Downloading new file from bucket %s file %s", s3.Bucket.Name, s3.Object.Key)
+		err := DownloadS3File(s3.Bucket.Name, s3.Object.Key)
+		for err != nil {
+			log.Printf("Error downloading from bucket %v\n", err)
+			log.Printf("Retrying after %d seconds...", errorRetrySeconds)
+			time.Sleep(errorRetrySeconds * time.Second)
+			err = DownloadS3File(s3.Bucket.Name, s3.Object.Key)
+		}
+
+		//unzip and file locally
+		log.Printf("Unzippping...")
+		err = unzip(tmpLocalFileGZName, tmpLocalFileCSVName)
+		for err != nil {
+			log.Printf("Error unzippping %v", err)
+			log.Printf("Retrying after %d seconds...", errorRetrySeconds)
+			os.Remove(tmpLocalFileCSVName)
+			time.Sleep(errorRetrySeconds * time.Second)
+			err = unzip(tmpLocalFileGZName, tmpLocalFileCSVName)
+		}
+
+		log.Printf("Inserting CSV into keyspaces...")
+		err = InsertCSVtoKeyspaces(tmpLocalFileCSVName)
+		for err != nil {
+			log.Printf("Error inserting CSV to keyspaces %v", err)
+			log.Printf("Retrying after %d seconds...", errorRetrySeconds)
+			time.Sleep(errorRetrySeconds * time.Second)
+			err = InsertCSVtoKeyspaces(tmpLocalFileCSVName)
+		}
+	}
+	log.Printf("Lambda Handler Done\n")
+}
+
 func main() {
-	var mostRecent time.Time
 	Init()
 
+	//this environment is set when called from labmda
+	isLambda := os.Getenv("CALLED_BY_LAMBDA")
+	if len(isLambda) != 0 {
+		log.Printf("Called by Lambda")
+		lambda.Start(handler)
+		return
+	}
+	//if this is not called by lambda, check s3 bucket and process every new file
+
+	var mostRecent time.Time
 	//this is the most recent time stamp that was processed from the bucket
 	mostRecent, _ = GetMostRecentTimestamp()
 
@@ -344,9 +409,12 @@ func main() {
 	// Create S3 service client
 	svc := s3.New(sess)
 	resp, err := svc.ListObjectsV2(&s3.ListObjectsV2Input{Bucket: aws.String(bucket)})
-	if err != nil {
-		exitErrorf("Unable to list items in bucket %q, %v", bucket, err)
+	for err != nil {
+		log.Printf("Unable to list items in bucket %q, %v", bucket, err)
+		log.Printf("Retrying after %d seconds...", errorRetrySeconds)
+		resp, err = svc.ListObjectsV2(&s3.ListObjectsV2Input{Bucket: aws.String(bucket)})
 	}
+
 	log.Printf("Listing bucket items")
 	for _, item := range resp.Contents {
 		//fmt.Println("Name:         ", *item.Key)
@@ -361,7 +429,7 @@ func main() {
 			err = DownloadS3File(bucket, *item.Key)
 			for err != nil {
 				log.Printf("Error downloading from bucket %v\n", err)
-				log.Printf("Retrying after 5 seconds...")
+				log.Printf("Retrying after %d seconds...", errorRetrySeconds)
 				time.Sleep(5 * time.Second)
 				err = DownloadS3File(bucket, *item.Key)
 			}
@@ -387,6 +455,7 @@ func main() {
 			}
 
 			//delete tmpLocalFileCSVName
+			os.Remove(tmpLocalFileCSVName)
 
 			//store the most recent time stamp for future reference
 			log.Printf("Saving most recent time stamp %v", mostRecent)
@@ -394,8 +463,8 @@ func main() {
 			//save the most recent timestamp in file
 			file, err := os.OpenFile(mostRecentTSFile, os.O_RDWR|os.O_TRUNC|os.O_CREATE, 0755)
 			if err != nil {
-				log.Fatalf("failed Trunc'ing file: %:s", err)
-
+				log.Fatalf("Failed recording most recent time to file: %s %s",
+					mostRecentTSFile, err)
 			}
 			file.Write([]byte(mostRecent.Format(timeLayout)))
 			file.Close()
@@ -404,9 +473,4 @@ func main() {
 		}
 	}
 	log.Printf("Done checking bucket\n")
-}
-
-func exitErrorf(msg string, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, msg+"\n", args...)
-	os.Exit(1)
 }
