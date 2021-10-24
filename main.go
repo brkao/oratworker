@@ -413,6 +413,7 @@ func handler(ctx context.Context, s3Event events.S3Event) {
 		scanner := bufio.NewScanner(buf)
 		//skip first line
 		scanner.Scan()
+		var insertCount uint64
 		for scanner.Scan() {
 			log.Printf(scanner.Text() + "\n")
 			s := strings.Split(scanner.Text(), ",")
@@ -423,15 +424,14 @@ func handler(ctx context.Context, s3Event events.S3Event) {
 			}
 
 			queryString := fmt.Sprintf(insertQuery, is...)
-
-			log.Printf(queryString)
 			err = cqlSession.Query(queryString).Exec()
+			insertCount++
 			if err != nil {
 				log.Printf("gocal query error %v\n", err)
 				return
 			}
 		}
-		return
+		log.Printf("Inserted %d rows", insertCount)
 	}
 	log.Printf("Lambda Handler Done\n")
 }
