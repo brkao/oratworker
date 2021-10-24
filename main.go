@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"errors"
@@ -17,16 +18,18 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
 
 const (
 	region              = "us-east-1"
-	bucket              = "obuck"
+	bucketCompressed    = "obuck"
+	bucketUncompressed  = "obuck1"
 	keyspacesHost       = "cassandra.us-east-1.amazonaws.com:9142"
 	keyspacesCRTUrl     = "https://certs.secureserver.net/repository/sf-class2-root.crt"
-	keyspacesCRTName    = "sf-class2-root.crt"
+	keyspacesCRTName    = "/tmp/sf-class2-root.crt"
 	mostRecentTSFile    = "mostRecent.time"
 	timeLayout          = time.RFC3339
 	tmpLocalFileGZName  = "snapshot.csv.gz"
@@ -296,6 +299,7 @@ func Init() error {
 	SecretAccessKey = os.Getenv("SECRET_ACCESS_KEY")
 	KeyspacesUser = os.Getenv("KEYSPACES_USER")
 	KeyspacesPass = os.Getenv("KEYSPACES_PASS")
+	fmt.Println(len(KeyspacesUser), len(KeyspacesPass))
 
 	if len(AccessKeyId) == 0 || len(SecretAccessKey) == 0 {
 		fmt.Printf("Invalid S3 credentials\n")
@@ -308,8 +312,9 @@ func Init() error {
 
 	os.Setenv("AWS_ACCESS_KEY_ID", AccessKeyId)
 	os.Setenv("AWS_SECRET_ACCESS_KEY", SecretAccessKey)
+	os.Setenv("AWS_SESSION_TOKEN", "")
 
-	log.Printf("Downloading keyspaces cert: keyspacesCRTUrl")
+	log.Printf("Downloading keyspaces cert: %s", keyspacesCRTUrl)
 	err := DownloadFile(keyspacesCRTName, keyspacesCRTUrl)
 	if err != nil {
 		return err
@@ -350,43 +355,93 @@ func GetMostRecentTimestamp() (time.Time, error) {
 func handler(ctx context.Context, s3Event events.S3Event) {
 	log.Printf("Lambda Handler Called\n")
 	for _, record := range s3Event.Records {
-		s3 := record.S3
+		s3record := record.S3
 		log.Printf("[%s - %s] Bucket = %s, Key = %s \n",
-			record.EventSource, record.EventTime, s3.Bucket.Name, s3.Object.Key)
-		log.Printf("Downloading new file from bucket %s file %s", s3.Bucket.Name, s3.Object.Key)
-		err := DownloadS3File(s3.Bucket.Name, s3.Object.Key)
-		for err != nil {
-			log.Printf("Error downloading from bucket %v\n", err)
-			log.Printf("Retrying after %d seconds...", errorRetrySeconds)
-			time.Sleep(errorRetrySeconds * time.Second)
-			err = DownloadS3File(s3.Bucket.Name, s3.Object.Key)
+			record.EventSource, record.EventTime, s3record.Bucket.Name, s3record.Object.Key)
+		log.Printf("New file from bucket %s file %s", s3record.Bucket.Name, s3record.Object.Key)
+
+		//check file path to make sure it's csv
+		fileExtension := filepath.Ext(s3record.Object.Key)
+		if fileExtension != ".csv" {
+			log.Printf("No a CSV file, Done")
+			return
 		}
 
-		//unzip and file locally
-		log.Printf("Unzippping...")
-		err = unzip(tmpLocalFileGZName, tmpLocalFileCSVName)
-		for err != nil {
-			log.Printf("Error unzippping %v", err)
-			log.Printf("Retrying after %d seconds...", errorRetrySeconds)
-			os.Remove(tmpLocalFileCSVName)
-			time.Sleep(errorRetrySeconds * time.Second)
-			err = unzip(tmpLocalFileGZName, tmpLocalFileCSVName)
+		log.Printf("Creating s3 session  ...")
+		//get the item from bucket
+		sess, err := session.NewSession(&aws.Config{
+			Region: aws.String(region)},
+		)
+		svc := s3.New(sess)
+
+		log.Printf("Reading file from s3 ...")
+		rawObject, err := svc.GetObject(
+			&s3.GetObjectInput{
+				Bucket: aws.String(s3record.Bucket.Name),
+				Key:    aws.String(s3record.Object.Key),
+			})
+		if err != nil {
+			log.Printf("Error GetObject: %v\n", err)
+			return
 		}
+		buf := new(bytes.Buffer)
+		buf.ReadFrom(rawObject.Body)
+
+		log.Printf("Connecting to keyspaces ...")
+		// add the Amazon Keyspaces service endpoint
+		cluster := gocql.NewCluster(keyspacesHost)
+		// add your service specific credentials
+		cluster.Authenticator = gocql.PasswordAuthenticator{
+			Username: KeyspacesUser,
+			Password: KeyspacesPass}
+		// provide the path to the sf-class2-root.crt
+		cluster.SslOpts = &gocql.SslOptions{
+			CaPath: keyspacesCRTName,
+		}
+		// Override default Consistency to LocalQuorum
+		cluster.Consistency = gocql.LocalQuorum
+		// Disable initial host lookup
+		cluster.DisableInitialHostLookup = true
+		cqlSession, err := cluster.CreateSession()
+		if err != nil {
+			log.Printf("Unable to create sql session: %v\n", err)
+			return
+		}
+		defer cqlSession.Close()
 
 		log.Printf("Inserting CSV into keyspaces...")
-		err = InsertCSVtoKeyspaces(tmpLocalFileCSVName)
-		for err != nil {
-			log.Printf("Error inserting CSV to keyspaces %v", err)
-			log.Printf("Retrying after %d seconds...", errorRetrySeconds)
-			time.Sleep(errorRetrySeconds * time.Second)
-			err = InsertCSVtoKeyspaces(tmpLocalFileCSVName)
+		scanner := bufio.NewScanner(buf)
+		//skip first line
+		scanner.Scan()
+		for scanner.Scan() {
+			log.Printf(scanner.Text() + "\n")
+			s := strings.Split(scanner.Text(), ",")
+
+			is := make([]interface{}, len(s), len(s))
+			for i := range s {
+				is[i] = s[i]
+			}
+
+			queryString := fmt.Sprintf(insertQuery, is...)
+
+			log.Printf(queryString)
+			err = cqlSession.Query(queryString).Exec()
+			if err != nil {
+				log.Printf("gocal query error %v\n", err)
+				return
+			}
 		}
+		return
 	}
 	log.Printf("Lambda Handler Done\n")
 }
 
 func main() {
-	Init()
+	err := Init()
+	if err != nil {
+		log.Printf("Init() error: %v", err)
+		return
+	}
 
 	//this environment is set when called from labmda
 	isLambda := os.Getenv("CALLED_BY_LAMBDA")
@@ -408,11 +463,11 @@ func main() {
 	)
 	// Create S3 service client
 	svc := s3.New(sess)
-	resp, err := svc.ListObjectsV2(&s3.ListObjectsV2Input{Bucket: aws.String(bucket)})
+	resp, err := svc.ListObjectsV2(&s3.ListObjectsV2Input{Bucket: aws.String(bucketCompressed)})
 	for err != nil {
-		log.Printf("Unable to list items in bucket %q, %v", bucket, err)
+		log.Printf("Unable to list items in bucket %q, %v", bucketCompressed, err)
 		log.Printf("Retrying after %d seconds...", errorRetrySeconds)
-		resp, err = svc.ListObjectsV2(&s3.ListObjectsV2Input{Bucket: aws.String(bucket)})
+		resp, err = svc.ListObjectsV2(&s3.ListObjectsV2Input{Bucket: aws.String(bucketCompressed)})
 	}
 
 	log.Printf("Listing bucket items")
@@ -426,12 +481,12 @@ func main() {
 			log.Printf("Downloading New Un-read file %s %v\n", *item.Key, *item.LastModified)
 
 			//download the file from s3 bucket
-			err = DownloadS3File(bucket, *item.Key)
+			err = DownloadS3File(bucketCompressed, *item.Key)
 			for err != nil {
 				log.Printf("Error downloading from bucket %v\n", err)
 				log.Printf("Retrying after %d seconds...", errorRetrySeconds)
 				time.Sleep(5 * time.Second)
-				err = DownloadS3File(bucket, *item.Key)
+				err = DownloadS3File(bucketCompressed, *item.Key)
 			}
 
 			//unzip and file locally
